@@ -97,7 +97,7 @@ type Config struct {
 func defaults() Config {
 	return Config{
 		RTSPURL:            "",
-		HTTPAddr:           ":8080",
+		HTTPAddr:           ":8001",
 		DetectionCooldownS: 5,
 		SessionTimeoutS:    60,
 		AutoCaptureEnabled: true,

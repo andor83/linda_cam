@@ -23,7 +23,7 @@ docker compose up -d --build
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
-Then open http://localhost:8080. First run prompts for a password; after
+Then open http://localhost:8001. First run prompts for a password; after
 logging in, paste your camera's RTSP URL into **Settings**, click **Save**,
 and open **Live**.
 
@@ -58,7 +58,7 @@ Most of these are exposed in the **Settings** tab. The full set lives in
 | Key | Default | What it does |
 | --- | --- | --- |
 | `rtsp_url`                  | (empty) | RTSP source URL. Use `rtsp://user:pass@host:554/path`. |
-| `http_addr`                 | `:8080` | Address the HTTP server binds to. |
+| `http_addr`                 | `:8001` | Address the HTTP server binds to. |
 | `password_hash`             | (empty) | bcrypt hash of the login password. Set on first run via the UI. |
 | `session_key`               | (random) | HMAC key for session cookies. Generated on first run. |
 | `session_timeout_s`         | 30 days | Session lifetime in seconds. |

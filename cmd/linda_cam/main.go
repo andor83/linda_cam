@@ -224,7 +224,7 @@ func main() {
 
 	addr := initial.HTTPAddr
 	if addr == "" {
-		addr = ":8080"
+		addr = ":8001"
 	}
 	srv := &http.Server{
 		Addr:              addr,

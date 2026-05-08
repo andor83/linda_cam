@@ -107,7 +107,7 @@ ENV LD_LIBRARY_PATH=/opt/linda_cam/lib \
     LINDA_APP_DIR=/opt/linda_cam \
     LINDA_DATA_DIR=/data
 
-EXPOSE 8080
+EXPOSE 8001
 VOLUME ["/data"]
 WORKDIR /data
 ENTRYPOINT ["/opt/linda_cam/entrypoint.sh"]
