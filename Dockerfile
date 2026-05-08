@@ -30,7 +30,9 @@ RUN pip install --no-cache-dir \
         "ultralytics==8.3.*" \
         "transformers==4.46.*" \
         "onnx==1.18.*" \
-        "onnxruntime==1.22.*"
+        "onnxruntime==1.22.*" \
+ && pip uninstall -y opencv-python \
+ && pip install --no-cache-dir opencv-python-headless
 
 # Pull the YOLOv8 OIV7 weights and export to ONNX.
 RUN mkdir -p /out/models && \
