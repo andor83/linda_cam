@@ -255,19 +255,35 @@ func main() {
 }
 
 func resolveTool(baseDir, name string) string {
-	bundled := filepath.Join(baseDir, "bin", name)
-	if _, err := os.Stat(bundled); err == nil {
-		return bundled
+	for _, dir := range candidateDirs(baseDir, "bin") {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
 	return name // fall back to PATH lookup
 }
 
 func resolveLib(baseDir, name string) string {
-	bundled := filepath.Join(baseDir, "lib", name)
-	if _, err := os.Stat(bundled); err == nil {
-		return bundled
+	for _, dir := range candidateDirs(baseDir, "lib") {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
 	return name
+}
+
+// candidateDirs returns sub-directories to search for bundled tools/libs:
+// the binary's own baseDir/<sub> first, then $LINDA_APP_DIR/<sub> if set
+// (the Docker layout, where the binary baseDir falls back to cwd /data
+// because there's no sibling web/ to anchor to).
+func candidateDirs(baseDir, sub string) []string {
+	dirs := []string{filepath.Join(baseDir, sub)}
+	if app := os.Getenv("LINDA_APP_DIR"); app != "" && app != baseDir {
+		dirs = append(dirs, filepath.Join(app, sub))
+	}
+	return dirs
 }
 
 // retentionLoop prunes pictures, orphaned thumbnails, and detection log
