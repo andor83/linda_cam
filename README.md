@@ -12,7 +12,7 @@ libx264), ONNX Runtime, and pre-exported YOLOv8 + bird-classifier ONNX
 models. Persistent state lives in `~/.birdcam/` on the host.
 
 ```bash
-git clone <this-repo> linda_cam && cd linda_cam
+git clone https://github.com/andor83/linda_cam.git && cd linda_cam
 
 # CPU-only (works on any host):
 docker compose up -d --build

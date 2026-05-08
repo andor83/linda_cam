@@ -23,8 +23,8 @@ WORKDIR /work
 RUN python3 -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 RUN pip install --no-cache-dir \
-        "torch==2.5.*" \
-        "torchvision==0.20.*" \
+        "torch==2.7.*" \
+        "torchvision==0.22.*" \
         --index-url https://download.pytorch.org/whl/cpu \
  && pip install --no-cache-dir \
         "ultralytics==8.3.*" \
