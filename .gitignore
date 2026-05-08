@@ -1,0 +1,39 @@
+# Built binaries
+/linda_cam
+/recompress
+
+# Web build artifacts
+/web/dist/
+/web/node_modules/
+/internal/web/dist/
+
+# Runtime data
+/config.json
+/pictures/
+/hls/
+/log.db*
+/sightings.db*
+
+# Vendored runtime tools
+/bin/ffmpeg
+/bin/ffmpeg-static
+/lib/*.so*
+
+# Models and weights
+/models/*.onnx
+/models/*.onnx.data
+/models/bird_classifier_classes.json
+*.pt
+
+# Local Python venv
+/.venv/
+
+# Editor / OS
+/.vscode/
+/.idea/
+.DS_Store
+._*
+*.log
+
+# Claude Code session settings
+/.claude/

@@ -1,0 +1,42 @@
+.git
+.gitignore
+.vscode
+.idea
+.claude
+.DS_Store
+._*
+
+# Local Python venv (rebuilt in model-builder stage)
+.venv
+
+# Build artifacts produced on the host
+linda_cam
+recompress
+bin/ffmpeg
+lib/*.so*
+
+# Web build artifacts (rebuilt in web-builder stage)
+web/node_modules
+web/dist
+internal/web/dist
+
+# Models and weights — rebuilt in model-builder stage
+models/*.onnx
+models/*.onnx.data
+models/bird_classifier_classes.json
+yolov8n-oiv7.pt
+yolov8n-oiv7.onnx
+yolov8n.pt
+*.pt
+
+# Runtime data — must not leak into image
+config.json
+log.db*
+sightings.db*
+pictures/
+hls/
+
+# Misc
+*.log
+Dockerfile
+docker-compose.yml

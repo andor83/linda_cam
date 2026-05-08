@@ -1,0 +1,138 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: #111;
+  color: #eee;
+}
+
+a { color: #6ea8ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.nav {
+  display: flex;
+  gap: 1.2rem;
+  padding: 0.8rem 1.2rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #2a2a2a;
+  align-items: center;
+}
+.nav .brand { font-weight: 600; color: #fff; }
+.nav .spacer { flex: 1; }
+.nav a.active { color: #fff; font-weight: 600; }
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.2rem;
+}
+
+button, input[type=submit] {
+  background: #2a6df4;
+  color: white;
+  border: none;
+  padding: 0.6rem 1.2rem;
+  border-radius: 4px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+button:hover { background: #1f5ad1; }
+button:disabled { background: #444; cursor: not-allowed; }
+button.secondary { background: #333; }
+button.secondary:hover { background: #444; }
+
+input[type=text], input[type=password], input[type=number], input[type=url] {
+  background: #222;
+  color: #eee;
+  border: 1px solid #333;
+  padding: 0.5rem 0.7rem;
+  border-radius: 4px;
+  font-size: 1rem;
+  width: 100%;
+}
+input:focus { outline: none; border-color: #2a6df4; }
+
+label { display: block; margin-bottom: 0.3rem; font-size: 0.9rem; color: #bbb; }
+
+.form-row { margin-bottom: 1rem; }
+
+.card {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  padding: 1.2rem;
+  margin-bottom: 1rem;
+}
+
+.bird-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 4px;
+  background: #333;
+  font-size: 0.9rem;
+}
+.bird-indicator.active { background: #2b7a2b; color: white; }
+.bird-indicator .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #888;
+}
+.bird-indicator.active .dot { background: #7fff7f; box-shadow: 0 0 8px #7fff7f; }
+
+video {
+  width: 100%;
+  max-width: 100%;
+  background: #000;
+  border-radius: 4px;
+}
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.8rem;
+}
+.gallery .thumb {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+}
+.gallery .thumb img { width: 100%; height: 100%; object-fit: cover; }
+.gallery .thumb .caption {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,0.6);
+  padding: 0.3rem 0.5rem;
+  font-size: 0.75rem;
+}
+.gallery .thumb .bird-tag {
+  position: absolute;
+  top: 0.3rem; right: 0.3rem;
+  background: #2b7a2b;
+  color: white;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+}
+
+.error { color: #ff6b6b; margin-top: 0.5rem; }
+.success { color: #7fff7f; margin-top: 0.5rem; }
+
+.login-wrap {
+  max-width: 400px;
+  margin: 4rem auto;
+}
+
+.controls-row {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}

@@ -1,0 +1,15 @@
+# GPU overlay. Use with:
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# Requires nvidia-container-toolkit on the host.
+
+services:
+  linda_cam:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video, compute, utility]
+    environment:
+      LINDA_HWACCEL: cuda

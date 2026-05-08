@@ -1,0 +1,34 @@
+# Persistent state lives at ~/.birdcam on the host:
+#   ~/.birdcam/config.json        — server config (RTSP URL, password, etc.)
+#   ~/.birdcam/log.db             — SQLite detection log
+#   ~/.birdcam/sightings.db       — SQLite sightings store
+#   ~/.birdcam/models/            — yolov8n.onnx, bird_classifier.onnx, ...
+#   ~/.birdcam/pictures/          — captured JPEGs
+#   ~/.birdcam/hls/               — HLS segments (transient)
+#
+# Default: CPU-only. HLS uses libx264; ONNX detection runs on the bundled CPU
+# onnxruntime. No host-side requirements beyond Docker.
+#
+# To enable NVIDIA GPU acceleration (h264_nvenc + faster encoding) add the
+# overlay file:
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# (Requires nvidia-container-toolkit on the host.)
+#
+# To force a mode regardless of detection, set LINDA_HWACCEL=cuda or =none.
+
+services:
+  linda_cam:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: linda_cam:local
+    container_name: linda_cam
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ${HOME}/.birdcam:/data
+    environment:
+      TZ: ${TZ:-UTC}
+      # LINDA_HWACCEL: cuda   # uncomment to force GPU
+      # LINDA_HWACCEL: none   # uncomment to force CPU

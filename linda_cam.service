@@ -1,0 +1,27 @@
+[Unit]
+Description=Linda Cam — RTSP viewer with HLS streaming and YOLO detection
+Documentation=https://github.com/linda/linda_cam
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=andy
+Group=andy
+WorkingDirectory=/home/andy/Projects/linda_cam
+Environment=LD_LIBRARY_PATH=/home/andy/Projects/linda_cam/lib
+ExecStart=/home/andy/Projects/linda_cam/launch.sh
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/andy/Projects/linda_cam
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
