@@ -1,6 +1,6 @@
 # Linda_Cam
 
-This is a single-binary 4K RTSP camera viewer for birds. It comes with an
+This is a single-binary 4K RTSP camera viewer for birds I made for my mom. It comes with an
  embedded Vue UI, HLS live stream (NVENC-accelerated when a GPU is available),
 manual snapshots, automatic YOLOv8 animal detection, and a 526-class bird
 species classifier. It can cross reference bird databases and use a third 
