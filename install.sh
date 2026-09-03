@@ -373,7 +373,47 @@ else
     skip "weights skipped — first start will fail unless models/yolov8n.onnx exists"
 fi
 
-# ---- Step 7: build the web UI -----------------------------------------------
+# ---- Step 7: export the ONNX models -----------------------------------------
+
+step "Export the ONNX models"
+
+if [[ -s "$APP_DIR/models/yolov8n.onnx" && -s "$APP_DIR/models/bird_classifier.onnx" \
+      && -s "$APP_DIR/models/bird_classifier_classes.json" ]]; then
+    ok "models/ already populated — nothing to export"
+elif [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
+    skip "no .venv — export skipped; drop your own ONNX models into $APP_DIR/models/"
+else
+    # launch.sh can export on first start, but the systemd unit runs with
+    # ProtectHome=read-only: the exporter cannot write its HuggingFace/torch
+    # caches under $HOME, so the service would crash-loop. Export here instead,
+    # as the invoking user, where those caches are writable.
+    info "the service runs sandboxed (ProtectHome=read-only) and cannot write the"
+    info "HuggingFace/torch caches under \$HOME, so exporting on first start fails."
+    info "Doing it now instead, as $(id -un)."
+    if confirm "Export the detector and bird classifier now (several minutes)?"; then
+        VPY="$APP_DIR/.venv/bin/python"
+        mkdir -p "$APP_DIR/models"
+        if [[ ! -s "$APP_DIR/models/yolov8n.onnx" ]]; then
+            [[ -s "$APP_DIR/yolov8n-oiv7.pt" ]] \
+                || die "yolov8n-oiv7.pt missing — re-run and accept the weights download"
+            ( cd "$APP_DIR" && "$VPY" -c \
+                "from ultralytics import YOLO; YOLO('yolov8n-oiv7.pt').export(format='onnx', opset=12, imgsz=640)" ) \
+                || die "YOLO export failed"
+            [[ -s "$APP_DIR/yolov8n-oiv7.onnx" ]] || die "ultralytics produced no yolov8n-oiv7.onnx"
+            mv "$APP_DIR/yolov8n-oiv7.onnx" "$APP_DIR/models/yolov8n.onnx"
+            ok "wrote models/yolov8n.onnx"
+        fi
+        if [[ ! -s "$APP_DIR/models/bird_classifier.onnx" ]]; then
+            ( cd "$APP_DIR" && "$VPY" tools/export_bird_classifier.py ) \
+                || die "bird classifier export failed"
+            ok "wrote models/bird_classifier.onnx"
+        fi
+    else
+        skip "export skipped — the service will crash-loop until models/ is populated"
+    fi
+fi
+
+# ---- Step 8: build the web UI -----------------------------------------------
 
 step "Build the Vue UI"
 
@@ -387,7 +427,7 @@ else
     skip "UI build skipped"
 fi
 
-# ---- Step 8: build the binary -----------------------------------------------
+# ---- Step 9: build the binary -----------------------------------------------
 
 step "Build the linda_cam binary"
 
@@ -403,7 +443,7 @@ fi
 
 [[ -x "$APP_DIR/linda_cam" ]] || warn "no linda_cam binary yet — the service will not start until one is built"
 
-# ---- Step 9: runtime directories and databases ------------------------------
+# ---- Step 10: runtime directories and databases ------------------------------
 
 step "Runtime directories and SQLite databases"
 
@@ -429,7 +469,7 @@ else
     skip "directory/database setup skipped"
 fi
 
-# ---- Step 10: NVENC check ---------------------------------------------------
+# ---- Step 11: NVENC check ---------------------------------------------------
 
 step "Hardware encoder check"
 
@@ -454,7 +494,7 @@ else
     fi
 fi
 
-# ---- Step 11: systemd unit --------------------------------------------------
+# ---- Step 12: systemd unit --------------------------------------------------
 
 if (( ! INSTALL_SERVICE )); then
     step "systemd service"
@@ -537,7 +577,7 @@ else
     ok "wrote $UNIT_PATH"
 fi
 
-# ---- Step 12: enable and start ----------------------------------------------
+# ---- Step 13: enable and start ----------------------------------------------
 
 step "Enable and start ${SERVICE_NAME}"
 
