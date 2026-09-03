@@ -42,6 +42,7 @@ YOLO_WEIGHTS_URL="https://github.com/ultralytics/assets/releases/download/v8.3.0
 ASSUME_YES=0
 SERVICE_SCOPE="system"
 if [[ "$OS" == "Darwin" ]]; then SERVICE_BACKEND="launchd"; else SERVICE_BACKEND="systemd"; fi
+if [[ "$OS" == "Darwin" ]]; then ORT_LIB_NAME="libonnxruntime.dylib"; else ORT_LIB_NAME="libonnxruntime.so"; fi
 INSTALL_SERVICE=1
 STEP=0
 
@@ -361,7 +362,7 @@ fi
 
 # ---- Step 4: ONNX Runtime shared library ------------------------------------
 
-step "ONNX Runtime ${ORT_VERSION} (lib/libonnxruntime.so)"
+step "ONNX Runtime ${ORT_VERSION} (lib/${ORT_LIB_NAME})"
 
 if [[ "$OS" == "Darwin" ]]; then
     ort_lib_glob="$APP_DIR/lib/libonnxruntime*.dylib"
@@ -418,26 +419,36 @@ elif [[ -x "$APP_DIR/.venv/bin/python" ]] \
      && "$APP_DIR/.venv/bin/python" -c 'import ultralytics, transformers, torch' >/dev/null 2>&1; then
     ok ".venv already has torch + transformers + ultralytics"
 else
-    info "models are missing, so launch.sh will export them on first start."
+    info "models are missing and must be exported before the service can start."
     info "That needs a .venv here with torch, transformers and ultralytics"
-    info "(a CPU-only torch wheel — roughly 2-3 GB of downloads)."
+    if [[ "$OS" == "Darwin" ]]; then
+        info "(PyPI torch build, Metal/MPS capable — roughly 2-3 GB of downloads)."
+    else
+        info "(a CPU-only torch wheel — roughly 2-3 GB of downloads)."
+    fi
     if confirm "Create $APP_DIR/.venv and install the export dependencies?"; then
         have python3 || die "python3 is required but not installed"
         [[ -x "$APP_DIR/.venv/bin/python" ]] || python3 -m venv "$APP_DIR/.venv" \
             || die "failed to create the venv (is python3-venv installed?)"
         VPIP="$APP_DIR/.venv/bin/pip"
+        info "venv python: $("$APP_DIR/.venv/bin/python" --version 2>&1)"
         "$VPIP" install --upgrade pip >/dev/null || warn "pip self-upgrade failed; continuing"
-        # Pins mirror the Dockerfile model-builder stage. The pytorch CPU
-        # index publishes no macOS wheels — PyPI's default build is the right
-        # one there, and it carries Metal/MPS support for the export.
         if [[ "$OS" == "Darwin" ]]; then
-            "$VPIP" install "torch==2.7.*" "torchvision==0.22.*" || die "torch install failed"
+            # The Dockerfile's exact pins are Linux-only. PyPI has no macOS
+            # wheels for torch 2.7 on current Python releases, and the pytorch
+            # CPU index has no macOS builds at all — so pin floors and let pip
+            # resolve a consistent, Metal-capable set for this venv's Python.
+            "$VPIP" install "torch>=2.7" "torchvision>=0.22" \
+                || die "torch install failed"
+            "$VPIP" install "ultralytics>=8.3" "transformers>=4.46" \
+                "onnx>=1.18" "onnxruntime>=1.22" || die "model export deps install failed"
         else
+            # Pins mirror the Dockerfile model-builder stage.
             "$VPIP" install "torch==2.7.*" "torchvision==0.22.*" \
                 --index-url https://download.pytorch.org/whl/cpu || die "torch install failed"
+            "$VPIP" install "ultralytics==8.3.*" "transformers==4.46.*" \
+                "onnx==1.18.*" "onnxruntime==1.22.*" || die "model export deps install failed"
         fi
-        "$VPIP" install "ultralytics==8.3.*" "transformers==4.46.*" \
-            "onnx==1.18.*" "onnxruntime==1.22.*" || die "model export deps install failed"
         # ultralytics pulls in full opencv; the headless build avoids needing X libs.
         "$VPIP" uninstall -y opencv-python >/dev/null 2>&1 || true
         "$VPIP" install opencv-python-headless || warn "opencv-python-headless install failed"
@@ -520,6 +531,12 @@ fi
 # ---- Step 9: build the binary -----------------------------------------------
 
 step "Build the linda_cam binary"
+
+# onnxruntime_go is a cgo package, so the build needs a working C toolchain.
+if [[ "$OS" == "Darwin" ]] && ! xcode-select -p >/dev/null 2>&1; then
+    warn "Xcode command line tools not found; cgo (needed by onnxruntime_go)"
+    warn "will fail. Install them with: xcode-select --install"
+fi
 
 if [[ -z "$GO_BIN" ]]; then
     skip "no usable Go toolchain — skipping build"
