@@ -98,9 +98,42 @@ Most of these are exposed in the **Settings** tab. The full set lives in
 
 ## Running outside Docker
 
-You'll need: Go 1.25+, Node 20+, system ffmpeg (with NVENC if you want GPU),
-ONNX Runtime, and Python with `ultralytics` + `transformers` + `torch` for
-first-run model exports.
+### Installing as a service (Linux and macOS)
+
+`./install.sh` walks through the whole bare-metal setup and registers
+linda_cam as a service that starts at boot. Every step asks first, so you can
+skip anything you'd rather handle yourself:
+
+```bash
+./install.sh                # interactive
+./install.sh --yes          # accept every step (unattended)
+./install.sh --user         # per-user service instead of a system one
+./install.sh --no-service   # build and provision only
+```
+
+It installs missing dependencies via the platform's package manager
+(apt/dnf/pacman/zypper on Linux, Homebrew on macOS), fetches Go and ONNX
+Runtime if needed, exports the ONNX models, builds the UI and binary, and
+writes the service definition:
+
+| Platform | Backend | System scope | User scope |
+| --- | --- | --- | --- |
+| Linux | systemd | `/etc/systemd/system/` | `~/.config/systemd/user/` |
+| macOS | launchd | `/Library/LaunchDaemons/` | `~/Library/LaunchAgents/` |
+
+The app runs **in place** — `config.json`, `pictures/`, `models/` and the
+SQLite databases all live in the repo directory, so keep it somewhere with
+room to spare.
+
+Models are exported during installation rather than on first start: the
+systemd unit runs with `ProtectHome=read-only`, so the exporter could not
+write its HuggingFace/torch caches under `$HOME` and the service would
+crash-loop.
+
+### Manual build
+
+You'll need: Go 1.25+, Node 20+, system ffmpeg, ONNX Runtime, and Python with
+`ultralytics` + `transformers` + `torch` for first-run model exports.
 
 ```bash
 make deps-web        # first time only: npm install
@@ -108,12 +141,23 @@ make web             # build Vue SPA
 make build           # compile linda_cam
 make fetch-onnxruntime
 make fetch-ffmpeg    # optional: static ffmpeg fallback into ./bin/
-./launch.sh          # exports models on first run, probes NVENC, exec's the binary
+./launch.sh          # exports models on first run, picks an encoder, exec's the binary
 ```
 
-`launch.sh` requires `h264_nvenc` ffmpeg. For a CPU-only bare-metal run,
-either use the Docker container or set `LINDA_HWACCEL=none` and adapt
-`launch.sh` to skip the NVENC requirement.
+### Hardware encoding
+
+`launch.sh` picks the best encoder available on the host and passes the
+choice to the server via `LINDA_HWACCEL`:
+
+| Platform | Preferred | Fallback |
+| --- | --- | --- |
+| Linux (NVIDIA) | `h264_nvenc` | `libx264` on CPU |
+| macOS | `h264_videotoolbox` | `libx264` on CPU |
+
+Set `LINDA_HWACCEL` to force one mode — `cuda`, `videotoolbox`, or `none`.
+Forcing a mode the host can't provide is a startup error rather than a silent
+downgrade. On macOS, Homebrew's ffmpeg ships VideoToolbox support
+(`brew install ffmpeg`).
 
 ## Endpoints (HTTP API)
 

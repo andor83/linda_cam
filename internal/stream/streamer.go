@@ -15,7 +15,8 @@ import (
 
 // Streamer runs a long-lived ffmpeg subprocess that pulls the RTSP stream
 // and produces an HLS playlist + fMP4 segments into OutDir. Video is encoded
-// with h264_nvenc when LINDA_HWACCEL=cuda, otherwise libx264 on CPU.
+// with h264_nvenc when LINDA_HWACCEL=cuda, h264_videotoolbox when it is
+// "videotoolbox" (macOS), otherwise libx264 on CPU.
 // Audio is either copied (AAC passthrough) or transcoded to MP3, controlled
 // by AudioMode.
 type Streamer struct {
@@ -134,14 +135,22 @@ func (s *Streamer) runOnce(ctx context.Context, url string) error {
 		"-hide_banner",
 		"-loglevel", "warning",
 	}
-	if hwaccel == "cuda" {
+	switch hwaccel {
+	case "cuda":
 		args = append(args, "-hwaccel", "cuda", "-hwaccel_output_format", "cuda")
+	case "videotoolbox":
+		// Decode on the GPU but let frames land back in system memory:
+		// h264_videotoolbox accepts them either way, and skipping
+		// -hwaccel_output_format avoids format-negotiation failures on
+		// sources the encoder can't take directly.
+		args = append(args, "-hwaccel", "videotoolbox")
 	}
 	args = append(args,
 		"-rtsp_transport", "tcp",
 		"-i", url,
 	)
-	if hwaccel == "cuda" {
+	switch hwaccel {
+	case "cuda":
 		args = append(args,
 			"-c:v", "h264_nvenc",
 			"-preset", "p4",
@@ -151,7 +160,21 @@ func (s *Streamer) runOnce(ctx context.Context, url string) error {
 			"-maxrate", "8M",
 			"-g", "30",
 		)
-	} else {
+	case "videotoolbox":
+		// VideoToolbox has no CRF mode — it is bitrate-driven only. realtime
+		// keeps the encoder from buffering ahead, which matters for a live
+		// HLS ladder.
+		args = append(args,
+			"-c:v", "h264_videotoolbox",
+			"-profile:v", "high",
+			"-b:v", "5M",
+			"-maxrate", "8M",
+			"-bufsize", "10M",
+			"-realtime", "1",
+			"-g", "30",
+			"-pix_fmt", "yuv420p",
+		)
+	default:
 		// CPU encode. veryfast keeps a single modern core busy at ~1080p; if
 		// the source is 4K and the host CPU can't keep up, ffmpeg will drop
 		// frames rather than blocking — visible as A/V drift but not a crash.

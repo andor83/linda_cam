@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -17,11 +18,11 @@ import (
 	"github.com/linda/linda_cam/internal/auth"
 	"github.com/linda/linda_cam/internal/birdinfo"
 	"github.com/linda/linda_cam/internal/capture"
-	"github.com/linda/linda_cam/internal/ebird"
 	"github.com/linda/linda_cam/internal/classifier"
 	"github.com/linda/linda_cam/internal/config"
 	"github.com/linda/linda_cam/internal/detector"
 	"github.com/linda/linda_cam/internal/detlog"
+	"github.com/linda/linda_cam/internal/ebird"
 	"github.com/linda/linda_cam/internal/httpapi"
 	"github.com/linda/linda_cam/internal/jpeg"
 	"github.com/linda/linda_cam/internal/rtsp"
@@ -60,7 +61,7 @@ func main() {
 	if audioMode == "" {
 		audioMode = "copy"
 	}
-	ortLibPath := resolveLib(baseDir, "libonnxruntime.so")
+	ortLibPath := resolveLib(baseDir, ortLibName())
 	modelPath := filepath.Join(baseDir, "models", "yolov8n.onnx")
 	birdModelPath := filepath.Join(baseDir, "models", "bird.onnx")
 	birdClsModelPath := filepath.Join(baseDir, "models", "bird_classifier.onnx")
@@ -262,6 +263,16 @@ func resolveTool(baseDir, name string) string {
 		}
 	}
 	return name // fall back to PATH lookup
+}
+
+// ortLibName is the ONNX Runtime shared-library filename for this platform.
+// The upstream release tarballs ship libonnxruntime.dylib on macOS and
+// libonnxruntime.so everywhere else.
+func ortLibName() string {
+	if runtime.GOOS == "darwin" {
+		return "libonnxruntime.dylib"
+	}
+	return "libonnxruntime.so"
 }
 
 func resolveLib(baseDir, name string) string {

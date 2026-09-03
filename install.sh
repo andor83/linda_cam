@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
-# Interactive bare-metal installer for linda_cam.
+# Interactive bare-metal installer for linda_cam. Runs on Linux and macOS.
 #
 # Installs linda_cam *in place* (the repo directory is the runtime directory —
 # config.json, pictures/, models/ and the SQLite DBs all live next to the
-# binary) and registers it with systemd so it starts at boot.
+# binary) and registers it as a service that starts at boot:
+#
+#   Linux  systemd unit      /etc/systemd/system/  (or ~/.config/systemd/user/)
+#   macOS  launchd job       /Library/LaunchDaemons/ (or ~/Library/LaunchAgents/)
+#
+# Hardware video encoding is used when available — NVENC on Linux/NVIDIA,
+# VideoToolbox on macOS — falling back to libx264 on CPU otherwise.
 #
 # Every step asks first. Answer 'n' to skip anything you've already done or
 # want to handle yourself; nothing is installed without a 'y'.
 #
 #   ./install.sh              # interactive
 #   ./install.sh --yes        # accept every step (unattended)
-#   ./install.sh --user       # install a --user unit instead of a system one
-#   ./install.sh --no-service # build/provision only, skip systemd
+#   ./install.sh --user       # per-user service (systemd --user / LaunchAgent)
+#   ./install.sh --no-service # build/provision only, skip service registration
 #   ./install.sh --help
 
 set -euo pipefail
 
 # ---- Constants --------------------------------------------------------------
 
-APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Resolve this script's directory without GNU readlink -f (absent on macOS).
+_src="$0"
+while [[ -h "$_src" ]]; do
+    _d="$(cd -P "$(dirname "$_src")" && pwd)"
+    _src="$(readlink "$_src")"
+    [[ "$_src" != /* ]] && _src="$_d/$_src"
+done
+APP_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+OS="$(uname -s)"
 SERVICE_NAME="linda_cam"
 GO_VERSION="1.25.0"                 # matches go.mod / Dockerfile
 ORT_VERSION="1.20.1"                # matches Makefile fetch-onnxruntime
@@ -27,6 +41,7 @@ YOLO_WEIGHTS_URL="https://github.com/ultralytics/assets/releases/download/v8.3.0
 
 ASSUME_YES=0
 SERVICE_SCOPE="system"
+if [[ "$OS" == "Darwin" ]]; then SERVICE_BACKEND="launchd"; else SERVICE_BACKEND="systemd"; fi
 INSTALL_SERVICE=1
 STEP=0
 
@@ -47,8 +62,9 @@ die()  { printf '\n%sERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 usage() {
     # Print the header comment block (everything after the shebang up to the
-    # first non-comment line), with the leading '# ' stripped.
-    sed -n '2,${/^#/!q; s/^#\{1,\} \{0,1\}//; p;}' "$0"
+    # first non-comment line), with the leading '# ' stripped. awk keeps this
+    # identical under BSD and GNU userland.
+    awk 'NR==1 { next } /^#/ { sub(/^#[ ]?/, ""); print; next } { exit }' "$0"
     exit 0
 }
 
@@ -64,7 +80,7 @@ confirm() {
         printf '  %s%s%s %s ' "$B" "$prompt" "$N" "$hint" >/dev/tty
         read -r reply </dev/tty || reply=""
         reply="${reply:-$default}"
-        case "${reply,,}" in
+        case "$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')" in
             y|yes) return 0 ;;
             n|no)  return 1 ;;
             *)     printf '    please answer y or n\n' >/dev/tty ;;
@@ -85,8 +101,26 @@ ask() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# ver_ge A B  -> true when version A >= version B
-ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]; }
+# ver_ge A B  -> true when version A >= version B.
+# Done in pure bash: BSD sort predates -V on older macOS releases.
+ver_ge() {
+    local i a b
+    local -a A B
+    IFS=. read -r -a A <<< "${1%%[-+]*}"
+    IFS=. read -r -a B <<< "${2%%[-+]*}"
+    for (( i = 0; i < ${#A[@]} || i < ${#B[@]}; i++ )); do
+        a="${A[i]:-0}"; a="${a//[^0-9]/}"; a=$(( 10#${a:-0} ))
+        b="${B[i]:-0}"; b="${b//[^0-9]/}"; b=$(( 10#${b:-0} ))
+        (( a > b )) && return 0
+        (( a < b )) && return 1
+    done
+    return 0
+}
+
+# stat(1) differs between GNU and BSD; wrap the one field we need.
+path_owner() {
+    if [[ "$OS" == "Darwin" ]]; then stat -f '%Su' "$1"; else stat -c '%U' "$1"; fi
+}
 
 arch_tag() {
     case "$(uname -m)" in
@@ -94,6 +128,17 @@ arch_tag() {
         aarch64|arm64) printf 'arm64' ;;
         *) die "unsupported CPU architecture: $(uname -m)" ;;
     esac
+}
+
+# Go release tarballs are named go<ver>.<goos>-<goarch>.tar.gz.
+go_os_tag() { if [[ "$OS" == "Darwin" ]]; then printf 'darwin'; else printf 'linux'; fi; }
+
+os_description() {
+    if [[ "$OS" == "Darwin" ]]; then
+        printf 'macOS %s (%s)' "$(sw_vers -productVersion 2>/dev/null || printf '?')" "$(uname -m)"
+    else
+        ( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-unknown}" )
+    fi
 }
 
 run_as_root() {
@@ -124,24 +169,34 @@ if (( ! ASSUME_YES )) && [[ ! -r /dev/tty ]]; then
     die "no terminal available for prompts — re-run with --yes for an unattended install"
 fi
 
-[[ "$(uname -s)" == "Linux" ]] || die "this installer targets Linux (systemd); use Docker on other platforms"
+case "$OS" in
+    Linux|Darwin) ;;
+    *) die "unsupported platform '$OS' (Linux and macOS only); use Docker elsewhere" ;;
+esac
 
 # ---- Package manager --------------------------------------------------------
 
 PM=""
-for candidate in apt-get dnf yum pacman zypper; do
-    if have "$candidate"; then PM="$candidate"; break; fi
-done
+if [[ "$OS" == "Darwin" ]]; then
+    have brew && PM="brew"
+else
+    for candidate in apt-get dnf yum pacman zypper; do
+        if have "$candidate"; then PM="$candidate"; break; fi
+    done
+fi
 PM_UPDATED=0
 
 # pkg_name <generic-name> — translate a logical package to this distro's name.
 pkg_name() {
     case "$1:$PM" in
-        sqlite3:pacman|sqlite3:dnf|sqlite3:yum|sqlite3:zypper) printf 'sqlite' ;;
+        sqlite3:pacman|sqlite3:dnf|sqlite3:yum|sqlite3:zypper|sqlite3:brew) printf 'sqlite' ;;
         pyvenv:apt-get) printf 'python3-venv' ;;
         pyvenv:pacman)  printf 'python' ;;
+        pyvenv:brew)    printf 'python' ;;
         pyvenv:*)       printf 'python3' ;;
-        python3:pacman) printf 'python' ;;
+        python3:pacman|python3:brew) printf 'python' ;;
+        nodejs:brew)    printf 'node' ;;
+        npm:brew)       printf 'node' ;;
         *)              printf '%s' "$1" ;;
     esac
 }
@@ -156,6 +211,8 @@ pkg_install() {
             fi
             run_as_root apt-get install -y "$@"
             ;;
+        # Homebrew refuses to run under sudo, by design.
+        brew)    brew install "$@" ;;
         dnf|yum) run_as_root "$PM" install -y "$@" ;;
         pacman)  run_as_root pacman -Sy --needed --noconfirm "$@" ;;
         zypper)  run_as_root zypper --non-interactive install "$@" ;;
@@ -168,9 +225,9 @@ cat <<BANNER
 ${B}linda_cam installer${N}
 
   app directory : ${APP_DIR}
-  distro        : $( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-unknown}" )
+  platform      : $(os_description)
   package mgr   : ${PM:-none detected}
-  service scope : ${SERVICE_SCOPE}$( (( INSTALL_SERVICE )) || printf ' (skipped)' )
+  service       : ${SERVICE_BACKEND}, ${SERVICE_SCOPE} scope$( (( INSTALL_SERVICE )) || printf ' (skipped)' )
 
 linda_cam runs from this directory: the binary, models, captured pictures and
 the SQLite databases all live here, so keep it on a disk with room to spare.
@@ -185,6 +242,15 @@ fi
 # ---- Step 1: system packages ------------------------------------------------
 
 step "System dependencies"
+
+if [[ "$OS" == "Darwin" && -z "$PM" ]]; then
+    warn "Homebrew not found — it is the only supported way to install the"
+    warn "missing pieces on macOS. Install it first with:"
+    warn '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    if ! confirm "Continue without a package manager?" n; then
+        die "install Homebrew, then re-run this script"
+    fi
+fi
 
 declare -a WANT_PKGS=()
 missing_note() { warn "$1 is missing"; }
@@ -217,7 +283,8 @@ fi
 step "Go toolchain (>= ${GO_VERSION})"
 
 GO_BIN=""
-for candidate in "$(command -v go 2>/dev/null || true)" "$HOME/.local/go/bin/go" /usr/local/go/bin/go; do
+for candidate in "$(command -v go 2>/dev/null || true)" "$HOME/.local/go/bin/go" \
+                 /usr/local/go/bin/go /opt/homebrew/bin/go; do
     [[ -n "$candidate" && -x "$candidate" ]] || continue
     found_ver="$("$candidate" env GOVERSION 2>/dev/null | sed 's/^go//')"
     if [[ -n "$found_ver" ]] && ver_ge "$found_ver" "$GO_VERSION"; then
@@ -230,7 +297,7 @@ for candidate in "$(command -v go 2>/dev/null || true)" "$HOME/.local/go/bin/go"
 done
 
 if [[ -z "$GO_BIN" ]]; then
-    GO_TGZ="go${GO_VERSION}.linux-$(arch_tag).tar.gz"
+    GO_TGZ="go${GO_VERSION}.$(go_os_tag)-$(arch_tag).tar.gz"
     info "no suitable Go found; would download https://go.dev/dl/${GO_TGZ}"
     info "and unpack it to $HOME/.local/go (no root needed)"
     if confirm "Install Go ${GO_VERSION} into \$HOME/.local/go?"; then
@@ -296,14 +363,25 @@ fi
 
 step "ONNX Runtime ${ORT_VERSION} (lib/libonnxruntime.so)"
 
-if compgen -G "$APP_DIR/lib/libonnxruntime.so*" >/dev/null; then
+if [[ "$OS" == "Darwin" ]]; then
+    ort_lib_glob="$APP_DIR/lib/libonnxruntime*.dylib"
+else
+    ort_lib_glob="$APP_DIR/lib/libonnxruntime.so*"
+fi
+
+if compgen -G "$ort_lib_glob" >/dev/null; then
     ok "already present in $APP_DIR/lib"
 elif confirm "Download ONNX Runtime ${ORT_VERSION} into $APP_DIR/lib?"; then
-    case "$(arch_tag)" in
-        amd64) ort_arch="x64" ;;
-        arm64) ort_arch="aarch64" ;;
-    esac
-    ort_name="onnxruntime-linux-${ort_arch}-${ORT_VERSION}"
+    if [[ "$OS" == "Darwin" ]]; then
+        # universal2 covers both Apple silicon and Intel Macs.
+        ort_name="onnxruntime-osx-universal2-${ORT_VERSION}"
+    else
+        case "$(arch_tag)" in
+            amd64) ort_arch="x64" ;;
+            arm64) ort_arch="aarch64" ;;
+        esac
+        ort_name="onnxruntime-linux-${ort_arch}-${ORT_VERSION}"
+    fi
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
     curl -fL --progress-bar -o "$tmp/ort.tgz" \
@@ -311,7 +389,13 @@ elif confirm "Download ONNX Runtime ${ORT_VERSION} into $APP_DIR/lib?"; then
         || die "failed to download ONNX Runtime"
     tar -C "$tmp" -xzf "$tmp/ort.tgz" || die "failed to unpack ONNX Runtime"
     mkdir -p "$APP_DIR/lib"
-    cp -a "$tmp/$ort_name/lib/"libonnxruntime.so* "$APP_DIR/lib/" || die "failed to copy libonnxruntime.so"
+    if [[ "$OS" == "Darwin" ]]; then
+        cp -a "$tmp/$ort_name/lib/"libonnxruntime*.dylib "$APP_DIR/lib/" \
+            || die "failed to copy libonnxruntime.dylib"
+    else
+        cp -a "$tmp/$ort_name/lib/"libonnxruntime.so* "$APP_DIR/lib/" \
+            || die "failed to copy libonnxruntime.so"
+    fi
     rm -rf "$tmp"; trap - EXIT
     ok "installed $(ls "$APP_DIR/lib" | tr '\n' ' ')"
 else
@@ -343,9 +427,15 @@ else
             || die "failed to create the venv (is python3-venv installed?)"
         VPIP="$APP_DIR/.venv/bin/pip"
         "$VPIP" install --upgrade pip >/dev/null || warn "pip self-upgrade failed; continuing"
-        # Pins mirror the Dockerfile model-builder stage.
-        "$VPIP" install "torch==2.7.*" "torchvision==0.22.*" \
-            --index-url https://download.pytorch.org/whl/cpu || die "torch install failed"
+        # Pins mirror the Dockerfile model-builder stage. The pytorch CPU
+        # index publishes no macOS wheels — PyPI's default build is the right
+        # one there, and it carries Metal/MPS support for the export.
+        if [[ "$OS" == "Darwin" ]]; then
+            "$VPIP" install "torch==2.7.*" "torchvision==0.22.*" || die "torch install failed"
+        else
+            "$VPIP" install "torch==2.7.*" "torchvision==0.22.*" \
+                --index-url https://download.pytorch.org/whl/cpu || die "torch install failed"
+        fi
         "$VPIP" install "ultralytics==8.3.*" "transformers==4.46.*" \
             "onnx==1.18.*" "onnxruntime==1.22.*" || die "model export deps install failed"
         # ultralytics pulls in full opencv; the headless build avoids needing X libs.
@@ -473,60 +563,150 @@ fi
 
 step "Hardware encoder check"
 
-NVENC_OK=0
+if [[ "$OS" == "Darwin" ]]; then
+    ACCEL_ENC="h264_videotoolbox"; ACCEL_NAME="VideoToolbox"
+else
+    ACCEL_ENC="h264_nvenc";        ACCEL_NAME="NVENC"
+fi
+
+ACCEL_OK=0
 if have ffmpeg; then
     # Buffer the encoder list: `| grep -q` would close the pipe early and give
     # ffmpeg SIGPIPE, which pipefail then reports as a failure.
-    if encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)" && [[ "$encoders" == *h264_nvenc* ]]; then
-        NVENC_OK=1
+    if encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)" \
+       && [[ "$encoders" == *"$ACCEL_ENC"* ]]; then
+        ACCEL_OK=1
     fi
 fi
 
-if (( NVENC_OK )); then
-    ok "ffmpeg supports h264_nvenc"
+if (( ACCEL_OK )); then
+    ok "ffmpeg supports $ACCEL_ENC — hardware encoding enabled ($ACCEL_NAME)"
 else
-    warn "no ffmpeg with h264_nvenc found."
-    warn "launch.sh requires NVENC and will exit at startup without it."
-    warn "Options: install an NVENC-capable ffmpeg + NVIDIA drivers, or run the"
-    warn "CPU-only Docker image instead (docker compose up -d)."
-    if ! confirm "Continue anyway?"; then
+    warn "no ffmpeg with $ACCEL_ENC found; launch.sh will fall back to libx264 on CPU."
+    if [[ "$OS" == "Darwin" ]]; then
+        warn "Homebrew's ffmpeg ships VideoToolbox: brew install ffmpeg"
+    else
+        warn "An NVENC-capable ffmpeg plus NVIDIA drivers would enable GPU encoding."
+    fi
+    warn "CPU encoding works but struggles with 4K sources."
+    if ! confirm "Continue with CPU encoding?"; then
         die "aborted at the encoder check"
     fi
 fi
 
-# ---- Step 12: systemd unit --------------------------------------------------
+# ---- Step 12: service definition --------------------------------------------
+# Two backends: systemd on Linux, launchd on macOS. Both expose the same four
+# operations (write / reload / enable / start) so the steps below stay shared.
 
 if (( ! INSTALL_SERVICE )); then
-    step "systemd service"
+    step "Service registration"
     skip "--no-service given — skipping service installation"
 else
 
-step "Install the systemd service"
+step "Install the ${SERVICE_BACKEND} service"
 
-have systemctl || die "systemd not found; re-run with --no-service and start ./launch.sh yourself"
+if [[ "$OS" == "Darwin" ]]; then
+    have launchctl || die "launchctl not found; re-run with --no-service and run ./launch.sh yourself"
 
-if [[ "$SERVICE_SCOPE" == "system" ]]; then
-    default_user="$(stat -c '%U' "$APP_DIR")"
-    while true; do
-        RUN_USER="$(ask "Run the service as which user?" "$default_user")"
-        if id "$RUN_USER" >/dev/null 2>&1; then break; fi
-        warn "user '$RUN_USER' does not exist"
-        (( ASSUME_YES )) && die "cannot resolve a service user"
-    done
-    RUN_GROUP="$(id -gn "$RUN_USER")"
-    UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
-    SYSTEMCTL=(run_as_root systemctl)
-    IDENTITY=$'User='"$RUN_USER"$'\nGroup='"$RUN_GROUP"$'\n'
-    WANTED_BY="multi-user.target"
+    SERVICE_LABEL="com.linda.${SERVICE_NAME}"
+    LOG_PATH="$APP_DIR/${SERVICE_NAME}.log"
+
+    if [[ "$SERVICE_SCOPE" == "system" ]]; then
+        default_user="$(path_owner "$APP_DIR")"
+        while true; do
+            RUN_USER="$(ask "Run the service as which user?" "$default_user")"
+            if id "$RUN_USER" >/dev/null 2>&1; then break; fi
+            warn "user '$RUN_USER' does not exist"
+            (( ASSUME_YES )) && die "cannot resolve a service user"
+        done
+        UNIT_PATH="/Library/LaunchDaemons/${SERVICE_LABEL}.plist"
+        LAUNCH_DOMAIN="system"
+        LAUNCHCTL=(run_as_root launchctl)
+        IDENTITY="    <key>UserName</key><string>${RUN_USER}</string>"$'\n'
+    else
+        RUN_USER="$(id -un)"
+        UNIT_PATH="$HOME/Library/LaunchAgents/${SERVICE_LABEL}.plist"
+        LAUNCH_DOMAIN="gui/$(id -u)"
+        LAUNCHCTL=(launchctl)
+        IDENTITY=""
+    fi
+
+    # launchd hands jobs a minimal PATH. launch.sh needs ffmpeg, jq and
+    # sqlite3, which on macOS usually live under a Homebrew prefix.
+    SERVICE_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    UNIT_TEXT='<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>'"${SERVICE_LABEL}"'</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>'"${APP_DIR}"'/launch.sh</string>
+    </array>
+    <key>WorkingDirectory</key><string>'"${APP_DIR}"'</string>
+'"${IDENTITY}"'    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>'"${SERVICE_PATH}"'</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
+    <key>StandardOutPath</key><string>'"${LOG_PATH}"'</string>
+    <key>StandardErrorPath</key><string>'"${LOG_PATH}"'</string>
+</dict>
+</plist>
+'
+
+    svc_install_file() {
+        if [[ "$SERVICE_SCOPE" == "system" ]]; then
+            printf '%s' "$UNIT_TEXT" | run_as_root tee "$UNIT_PATH" >/dev/null
+            # launchd refuses to load a daemon plist that is not root-owned
+            # and not group/world writable.
+            run_as_root chown root:wheel "$UNIT_PATH"
+            run_as_root chmod 644 "$UNIT_PATH"
+        else
+            mkdir -p "$(dirname "$UNIT_PATH")"
+            printf '%s' "$UNIT_TEXT" > "$UNIT_PATH"
+        fi
+    }
+    # launchd has no daemon-reload; bootstrap picks the file up directly.
+    svc_reload() { :; }
+    svc_enable() {
+        # Replace any previous definition so a re-run is idempotent.
+        "${LAUNCHCTL[@]}" bootout "$LAUNCH_DOMAIN/$SERVICE_LABEL" >/dev/null 2>&1 || true
+        "${LAUNCHCTL[@]}" bootstrap "$LAUNCH_DOMAIN" "$UNIT_PATH"
+    }
+    svc_start()  { "${LAUNCHCTL[@]}" kickstart -k "$LAUNCH_DOMAIN/$SERVICE_LABEL"; }
+    svc_status() { "${LAUNCHCTL[@]}" print "$LAUNCH_DOMAIN/$SERVICE_LABEL" 2>&1 | sed -n '1,25p'; }
+
 else
-    RUN_USER="$(id -un)"
-    UNIT_PATH="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
-    SYSTEMCTL=(systemctl --user)
-    IDENTITY=""
-    WANTED_BY="default.target"
-fi
+    have systemctl || die "systemd not found; re-run with --no-service and run ./launch.sh yourself"
 
-UNIT_TEXT="[Unit]
+    if [[ "$SERVICE_SCOPE" == "system" ]]; then
+        default_user="$(path_owner "$APP_DIR")"
+        while true; do
+            RUN_USER="$(ask "Run the service as which user?" "$default_user")"
+            if id "$RUN_USER" >/dev/null 2>&1; then break; fi
+            warn "user '$RUN_USER' does not exist"
+            (( ASSUME_YES )) && die "cannot resolve a service user"
+        done
+        RUN_GROUP="$(id -gn "$RUN_USER")"
+        UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+        SYSTEMCTL=(run_as_root systemctl)
+        IDENTITY=$'User='"$RUN_USER"$'\nGroup='"$RUN_GROUP"$'\n'
+        WANTED_BY="multi-user.target"
+    else
+        RUN_USER="$(id -un)"
+        UNIT_PATH="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
+        SYSTEMCTL=(systemctl --user)
+        IDENTITY=""
+        WANTED_BY="default.target"
+    fi
+
+    UNIT_TEXT="[Unit]
 Description=Linda Cam — RTSP viewer with HLS streaming and YOLO detection
 Documentation=https://github.com/linda/linda_cam
 After=network-online.target
@@ -553,27 +733,36 @@ ProtectControlGroups=true
 WantedBy=${WANTED_BY}
 "
 
-info "unit file: $UNIT_PATH"
+    svc_install_file() {
+        if [[ "$SERVICE_SCOPE" == "system" ]]; then
+            printf '%s' "$UNIT_TEXT" | run_as_root tee "$UNIT_PATH" >/dev/null
+        else
+            mkdir -p "$(dirname "$UNIT_PATH")"
+            printf '%s' "$UNIT_TEXT" > "$UNIT_PATH"
+        fi
+    }
+    svc_reload() { "${SYSTEMCTL[@]}" daemon-reload; }
+    svc_enable() { "${SYSTEMCTL[@]}" enable "${SERVICE_NAME}.service"; }
+    svc_start()  { "${SYSTEMCTL[@]}" restart "${SERVICE_NAME}.service"; }
+    svc_status() { "${SYSTEMCTL[@]}" --no-pager --full status "${SERVICE_NAME}.service" || true; }
+fi
+
+info "service file: $UNIT_PATH"
 printf '%s\n' "$UNIT_TEXT" | sed 's/^/    | /'
 
 WRITE_UNIT=1
 if [[ -e "$UNIT_PATH" ]]; then
     confirm "$UNIT_PATH already exists — overwrite it?" || WRITE_UNIT=0
 else
-    confirm "Write this unit file?" || WRITE_UNIT=0
+    confirm "Write this service file?" || WRITE_UNIT=0
 fi
 
 if (( ! WRITE_UNIT )); then
-    skip "unit file not written"
+    skip "service file not written"
 else
     chmod +x "$APP_DIR/launch.sh"
-    if [[ "$SERVICE_SCOPE" == "system" ]]; then
-        printf '%s' "$UNIT_TEXT" | run_as_root tee "$UNIT_PATH" >/dev/null
-    else
-        mkdir -p "$(dirname "$UNIT_PATH")"
-        printf '%s' "$UNIT_TEXT" > "$UNIT_PATH"
-    fi
-    "${SYSTEMCTL[@]}" daemon-reload
+    svc_install_file
+    svc_reload
     ok "wrote $UNIT_PATH"
 fi
 
@@ -582,19 +771,24 @@ fi
 step "Enable and start ${SERVICE_NAME}"
 
 if [[ ! -e "$UNIT_PATH" ]]; then
-    skip "no unit file installed — nothing to enable"
+    skip "no service file installed — nothing to enable"
 else
     if confirm "Enable ${SERVICE_NAME} to start at boot?"; then
-        if "${SYSTEMCTL[@]}" enable "${SERVICE_NAME}.service"; then
+        if svc_enable; then
             ok "enabled"
         else
-            warn "systemctl enable failed"
+            warn "enabling the service failed"
         fi
         if [[ "$SERVICE_SCOPE" == "user" ]]; then
-            info "user services only run while you're logged in unless lingering is on"
-            if confirm "Enable lingering so it starts at boot without a login?"; then
-                run_as_root loginctl enable-linger "$RUN_USER" && ok "lingering enabled for $RUN_USER" || \
-                    warn "loginctl enable-linger failed"
+            if [[ "$OS" == "Darwin" ]]; then
+                info "a LaunchAgent starts at login, not at boot; use --system for a"
+                info "LaunchDaemon that runs before anyone logs in"
+            else
+                info "user services only run while you're logged in unless lingering is on"
+                if confirm "Enable lingering so it starts at boot without a login?"; then
+                    run_as_root loginctl enable-linger "$RUN_USER" && ok "lingering enabled for $RUN_USER" || \
+                        warn "loginctl enable-linger failed"
+                fi
             fi
         fi
     else
@@ -602,12 +796,12 @@ else
     fi
 
     if confirm "Start ${SERVICE_NAME} now?"; then
-        if "${SYSTEMCTL[@]}" restart "${SERVICE_NAME}.service"; then
+        if svc_start; then
             ok "started"
         else
             warn "start failed — check the logs below"
         fi
-        "${SYSTEMCTL[@]}" --no-pager --full status "${SERVICE_NAME}.service" || true
+        svc_status || true
     else
         skip "not started"
     fi
@@ -617,10 +811,26 @@ fi  # INSTALL_SERVICE
 
 # ---- Summary ----------------------------------------------------------------
 
-if [[ "$SERVICE_SCOPE" == "system" ]]; then
-    CTL="sudo systemctl"; JOURNAL="sudo journalctl -u ${SERVICE_NAME} -f"
+if [[ "$OS" == "Darwin" ]]; then
+    LABEL="com.linda.${SERVICE_NAME}"
+    if [[ "$SERVICE_SCOPE" == "system" ]]; then
+        DOMAIN="system"; LCTL="sudo launchctl"
+    else
+        DOMAIN="gui/$(id -u)"; LCTL="launchctl"
+    fi
+    CMD_STATUS="${LCTL} print ${DOMAIN}/${LABEL}"
+    CMD_LOGS="tail -f ${APP_DIR}/${SERVICE_NAME}.log"
+    CMD_RESTART="${LCTL} kickstart -k ${DOMAIN}/${LABEL}"
+    CMD_STOP="${LCTL} bootout ${DOMAIN}/${LABEL}"
 else
-    CTL="systemctl --user"; JOURNAL="journalctl --user -u ${SERVICE_NAME} -f"
+    if [[ "$SERVICE_SCOPE" == "system" ]]; then
+        CTL="sudo systemctl"; CMD_LOGS="sudo journalctl -u ${SERVICE_NAME} -f"
+    else
+        CTL="systemctl --user"; CMD_LOGS="journalctl --user -u ${SERVICE_NAME} -f"
+    fi
+    CMD_STATUS="${CTL} status ${SERVICE_NAME}"
+    CMD_RESTART="${CTL} restart ${SERVICE_NAME}"
+    CMD_STOP="${CTL} stop ${SERVICE_NAME} && ${CTL} disable ${SERVICE_NAME}"
 fi
 
 PORT="8001"
@@ -638,10 +848,12 @@ ${B}Done.${N}
                  camera's RTSP URL into Settings, Save, and restart the
                  service so launch.sh can probe the stream.
 
-  Status         ${CTL} status ${SERVICE_NAME}
-  Logs           ${JOURNAL}
-  Restart        ${CTL} restart ${SERVICE_NAME}
-  Stop / disable ${CTL} stop ${SERVICE_NAME} && ${CTL} disable ${SERVICE_NAME}
+  Encoding       $( (( ACCEL_OK )) && printf '%s (hardware)' "$ACCEL_ENC" || printf 'libx264 (CPU)' )
+
+  Status         ${CMD_STATUS}
+  Logs           ${CMD_LOGS}
+  Restart        ${CMD_RESTART}
+  Stop / disable ${CMD_STOP}
 
   Runtime files  ${APP_DIR}/{config.json,log.db,sightings.db,pictures/,models/}
 SUMMARY
