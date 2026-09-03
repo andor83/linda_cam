@@ -12,15 +12,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	"log"
 	"math"
 	"os"
 	"sort"
-	"strings"
 
 	"golang.org/x/image/draw"
 
 	ort "github.com/yalue/onnxruntime_go"
+
+	"github.com/linda/linda_cam/internal/ortep"
 )
 
 // Guess is one (species, confidence) prediction.
@@ -95,16 +95,7 @@ func New(modelPath, classesPath string) (*Classifier, error) {
 	}
 	defer opts.Destroy()
 
-	if strings.ToLower(os.Getenv("LINDA_DETECTOR_DEVICE")) != "cpu" {
-		if cudaOpts, err := ort.NewCUDAProviderOptions(); err == nil {
-			if appendErr := opts.AppendExecutionProviderCUDA(cudaOpts); appendErr != nil {
-				log.Printf("classifier: CUDA EP registration failed (%v); CPU fallback", appendErr)
-			} else {
-				log.Printf("classifier: CUDA execution provider enabled")
-			}
-			_ = cudaOpts.Destroy()
-		}
-	}
+	ortep.Enable(opts, "classifier")
 
 	sess, err := ort.NewAdvancedSession(modelPath,
 		[]string{inputName}, []string{outputName},

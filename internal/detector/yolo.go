@@ -20,6 +20,8 @@ import (
 
 	ort "github.com/yalue/onnxruntime_go"
 
+	"github.com/linda/linda_cam/internal/ortep"
+
 	"github.com/linda/linda_cam/internal/aiquality"
 	"github.com/linda/linda_cam/internal/capture"
 	"github.com/linda/linda_cam/internal/classifier"
@@ -317,27 +319,8 @@ func loadSession(modelPath, canonicalOverride string) (*yoloSession, error) {
 	}
 	defer opts.Destroy()
 
-	// Try to enable the CUDA execution provider. Skipped when LINDA_DETECTOR_DEVICE=cpu,
-	// or when the CUDA provider .so / GPU / driver aren't available — the
-	// session falls back to the default CPU EP silently.
-	device := "cuda"
-	switch strings.ToLower(os.Getenv("LINDA_DETECTOR_DEVICE")) {
-	case "cpu":
-		device = "cpu"
-	}
-	if device == "cuda" {
-		cudaOpts, err := ort.NewCUDAProviderOptions()
-		if err != nil {
-			log.Printf("detector: CUDA provider options unavailable (%v); falling back to CPU", err)
-		} else {
-			if appendErr := opts.AppendExecutionProviderCUDA(cudaOpts); appendErr != nil {
-				log.Printf("detector: CUDA EP registration failed (%v); falling back to CPU", appendErr)
-			} else {
-				log.Printf("detector: CUDA execution provider enabled for %q", modelPath)
-			}
-			_ = cudaOpts.Destroy()
-		}
-	}
+	// CoreML on macOS, CUDA elsewhere; both fall back to the CPU provider.
+	ortep.Enable(opts, "detector")
 
 	session, err := ort.NewAdvancedSession(modelPath,
 		[]string{inputName}, []string{outputName},
