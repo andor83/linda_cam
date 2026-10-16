@@ -40,6 +40,118 @@ file_size() {
     fi
 }
 
+# ---- Service control --------------------------------------------------------
+# ./launch.sh start|stop|restart|status|logs drives the service install.sh
+# set up (launchd on macOS, systemd on Linux). With no argument, or "run",
+# fall through and start the server in the foreground — that is what the
+# service itself invokes.
+#   LINDA_SERVICE_NAME   service name given to install.sh --name (default linda_cam)
+#   LINDA_SERVICE_SCOPE  system | user; auto-detected from the installed file
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: ./launch.sh [run|start|stop|restart|status|logs]
+  run      start the server in the foreground (default)
+  start    start the installed service
+  stop     stop the service (it starts again at boot/login)
+  restart  restart the service, re-running the stream probe
+  status   show service state
+  logs     follow the service log
+USAGE
+}
+
+# as_root <cmd...> — run directly when already root, else via sudo.
+as_root() {
+    if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi
+}
+
+service_ctl() {
+    local action="$1" name="${LINDA_SERVICE_NAME:-linda_cam}"
+    local scope="${LINDA_SERVICE_SCOPE:-}" sys_file user_file file
+
+    if [[ "$OS" == "Darwin" ]]; then
+        local label="com.linda.${name}"
+        sys_file="/Library/LaunchDaemons/${label}.plist"
+        user_file="$HOME/Library/LaunchAgents/${label}.plist"
+    else
+        sys_file="/etc/systemd/system/${name}.service"
+        user_file="$HOME/.config/systemd/user/${name}.service"
+    fi
+    if [[ -z "$scope" ]]; then
+        if [[ -e "$sys_file" ]]; then scope="system"
+        elif [[ -e "$user_file" ]]; then scope="user"
+        else die "no ${name} service installed ($sys_file or $user_file); run ./install.sh, or ./launch.sh to run in the foreground"
+        fi
+    fi
+    case "$scope" in
+        system) file="$sys_file" ;;
+        user)   file="$user_file" ;;
+        *) die "unknown LINDA_SERVICE_SCOPE='$scope' (expected system or user)" ;;
+    esac
+    [[ -e "$file" ]] || die "service file not found: $file"
+
+    if [[ "$OS" == "Darwin" ]]; then
+        local domain target
+        local -a lctl
+        if [[ "$scope" == "system" ]]; then
+            domain="system"; lctl=(as_root launchctl)
+        else
+            domain="gui/$(id -u)"; lctl=(launchctl)
+        fi
+        target="$domain/$label"
+        loaded() { "${lctl[@]}" print "$target" >/dev/null 2>&1; }
+
+        case "$action" in
+            start)
+                # Not loaded (e.g. after stop) -> bootstrap, which runs it via
+                # RunAtLoad; already loaded -> kickstart, a no-op if running.
+                if loaded; then "${lctl[@]}" kickstart "$target"
+                else "${lctl[@]}" bootstrap "$domain" "$file"
+                fi
+                log "started $target" ;;
+            stop)
+                # KeepAlive relaunches a killed job, so unload it instead.
+                if loaded; then "${lctl[@]}" bootout "$target"; log "stopped $target"
+                else log "$target is not loaded"
+                fi ;;
+            restart)
+                if loaded; then "${lctl[@]}" kickstart -k "$target"
+                else "${lctl[@]}" bootstrap "$domain" "$file"
+                fi
+                log "restarted $target" ;;
+            status)
+                if loaded; then "${lctl[@]}" print "$target" | sed -n '1,25p'
+                else log "$target is not loaded (stopped)"; return 3
+                fi ;;
+            logs)
+                local logf
+                logf="$(plutil -extract StandardOutPath raw "$file" 2>/dev/null)" \
+                    || logf="$PWD/${name}.log"
+                exec tail -n 100 -f "$logf" ;;
+        esac
+    else
+        local unit="${name}.service"
+        local -a sctl jctl
+        if [[ "$scope" == "system" ]]; then
+            sctl=(as_root systemctl); jctl=(as_root journalctl)
+        else
+            sctl=(systemctl --user); jctl=(journalctl --user)
+        fi
+        case "$action" in
+            start|stop|restart) "${sctl[@]}" "$action" "$unit"; log "${action}: $unit" ;;
+            status) "${sctl[@]}" --no-pager --full status "$unit" ;;
+            logs)   exec "${jctl[@]}" -u "$name" -n 100 -f ;;
+        esac
+    fi
+}
+
+case "${1:-run}" in
+    run) ;;
+    start|stop|restart|status|logs) service_ctl "$1"; exit $? ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+esac
+
 # ---- 0. First-run init ------------------------------------------------------
 
 VENV_PY="$PWD/.venv/bin/python"
