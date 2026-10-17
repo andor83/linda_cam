@@ -169,6 +169,12 @@ export interface Status {
   animals_present: Detection[]
   last_capture_at: string
   detector_ready: boolean
+  /** HLS encoder wrote a fresh segment within the last few seconds. */
+  stream_live: boolean
+  /** Age of the newest detector frame in seconds; -1 if none yet. */
+  frame_age_s: number
+  /** Zero time ("0001-01-01...") if the camera has never delivered a frame. */
+  last_frame_at: string
 }
 
 export interface DetectionLogEntry {

@@ -51,12 +51,58 @@ const debugJson = computed(() =>
 let hls: Hls | null = null
 let statusTimer: number | undefined
 let debugTimer: number | undefined
+let stallTimer: number | undefined
+let restartTimer: number | undefined
+let mediaRecoveries = 0
+
+// Player watchdog. When the server restarts its encoder after a camera
+// dropout, the playlist pauses and then resumes with a discontinuity;
+// hls.js usually rides that out, but it can also wedge on the last
+// buffered segment (the "frozen / looping" picture). If the playhead
+// hasn't moved in STALL_S while the stream is supposed to be live, tear
+// the player down and start fresh instead of waiting for a reload.
+const STALL_S = 15
+const RESTART_DELAY_MS = 2000
+let lastTime = -1
+let lastAdvance = 0
+
+function scheduleRestart(reason: string) {
+  if (restartTimer) return
+  streamError.value = `Stream ${reason} — reconnecting…`
+  restartTimer = window.setTimeout(() => {
+    restartTimer = undefined
+    stopStream()
+    startStream()
+  }, RESTART_DELAY_MS)
+}
+
+function checkStall() {
+  const v = videoEl.value
+  if (!v || v.paused || v.ended) return
+  const now = Date.now()
+  if (v.currentTime !== lastTime) {
+    lastTime = v.currentTime
+    lastAdvance = now
+    if (streamError.value.endsWith('reconnecting…')) streamError.value = ''
+    return
+  }
+  // Don't thrash while the server itself says the camera is down; the
+  // player will be restarted once frames are flowing again.
+  const live = status.value?.stream_live ?? true
+  if (live && now - lastAdvance > STALL_S * 1000) {
+    lastAdvance = now
+    scheduleRestart('stalled')
+  }
+}
 
 function startStream() {
   streamError.value = ''
   const v = videoEl.value
   if (!v) return
   const src = '/api/live/stream.m3u8'
+  lastTime = -1
+  lastAdvance = Date.now()
+  mediaRecoveries = 0
 
   if (Hls.isSupported()) {
     hls = new Hls({
@@ -67,17 +113,27 @@ function startStream() {
     })
     hls.loadSource(src)
     hls.attachMedia(v)
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      v.play().catch(() => { /* autoplay policy; user can press play */ })
+    })
     hls.on(Hls.Events.ERROR, (_e, data) => {
       if (!data.fatal) return
       streamError.value = `Stream error: ${data.type}/${data.details}`
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        hls?.startLoad()
-      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        // Playlist 503s while ffmpeg reconnects; hls.js has already
+        // exhausted its own retries by the time this is fatal, so back
+        // off briefly and rebuild rather than hammering startLoad().
+        scheduleRestart('unavailable')
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
+        mediaRecoveries++
         hls?.recoverMediaError()
+      } else {
+        scheduleRestart('failed')
       }
     })
   } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
     v.src = src
+    v.addEventListener('error', () => scheduleRestart('failed'), { once: true })
   } else {
     streamError.value = 'HLS is not supported in this browser'
   }
@@ -93,6 +149,10 @@ function stopStream() {
     videoEl.value.load()
   }
 }
+
+const neverConnected = computed(
+  () => !status.value?.last_frame_at || status.value.last_frame_at.startsWith('0001-'),
+)
 
 async function refreshStatus() {
   try {
@@ -160,12 +220,15 @@ onMounted(() => {
   startStream()
   refreshStatus()
   statusTimer = window.setInterval(refreshStatus, 1500)
+  stallTimer = window.setInterval(checkStall, 2000)
 })
 
 onUnmounted(() => {
+  if (restartTimer) window.clearTimeout(restartTimer)
   stopStream()
   if (statusTimer) window.clearInterval(statusTimer)
   if (debugTimer) window.clearInterval(debugTimer)
+  if (stallTimer) window.clearInterval(stallTimer)
 })
 </script>
 
@@ -244,9 +307,12 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="error" v-if="streamError">{{ streamError }}</div>
-      <div class="error" v-else-if="status && !status.rtsp_connected">
+      <div class="error" v-else-if="status && !status.rtsp_connected && neverConnected">
         Not connected to camera — check the RTSP URL in
         <router-link :to="{ name: 'settings' }">Settings</router-link>.
+      </div>
+      <div class="error" v-else-if="status && !status.rtsp_connected">
+        Camera connection lost — reconnecting automatically…
       </div>
     </div>
   </div>

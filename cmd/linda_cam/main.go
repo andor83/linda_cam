@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/linda/linda_cam/internal/ebird"
 	"github.com/linda/linda_cam/internal/httpapi"
 	"github.com/linda/linda_cam/internal/jpeg"
+	"github.com/linda/linda_cam/internal/logutil"
 	"github.com/linda/linda_cam/internal/rtsp"
 	"github.com/linda/linda_cam/internal/sightings"
 	"github.com/linda/linda_cam/internal/stream"
@@ -33,6 +35,9 @@ import (
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	if closeLog := setupLogFile(); closeLog != nil {
+		defer closeLog()
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -371,4 +376,34 @@ func ebirdRefreshLoop(ctx context.Context, det *detector.Detector, cfgStore *con
 			run()
 		}
 	}
+}
+
+// setupLogFile routes the log to a size-capped rotating file when
+// LINDA_LOG_FILE is set (launch.sh sets it for the macOS service, whose
+// launchd otherwise appends to one file forever). LINDA_LOG_MAX_MB (default
+// 20) caps each file and LINDA_LOG_KEEP (default 3) is how many rotated
+// copies to retain. stderr is left alone so journald/docker setups, which
+// rotate on their own, are unaffected. Returns a closer, or nil if the
+// log stays on stderr.
+func setupLogFile() func() {
+	path := os.Getenv("LINDA_LOG_FILE")
+	if path == "" {
+		return nil
+	}
+	maxMB := int64(20)
+	if v, err := strconv.ParseInt(os.Getenv("LINDA_LOG_MAX_MB"), 10, 64); err == nil && v > 0 {
+		maxMB = v
+	}
+	keep := 3
+	if v, err := strconv.Atoi(os.Getenv("LINDA_LOG_KEEP")); err == nil && v >= 0 {
+		keep = v
+	}
+	f, err := logutil.OpenRotating(path, maxMB<<20, keep)
+	if err != nil {
+		log.Printf("log file %s: %v (logging to stderr)", path, err)
+		return nil
+	}
+	log.SetOutput(f)
+	log.Printf("logging to %s (rotate at %d MB, keep %d)", path, maxMB, keep)
+	return func() { _ = f.Close() }
 }

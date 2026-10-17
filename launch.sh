@@ -354,6 +354,17 @@ if [[ ! -x ./linda_cam ]]; then
     die "./linda_cam binary not found or not executable (run 'make build')"
 fi
 
+# Log rotation. launchd appends stdout/stderr to <name>.log forever, so when
+# running as the macOS service (stderr is not a terminal) hand the binary that
+# same path and let it rotate: 20 MB per file, 3 old copies kept. Rotation is
+# by rename, so the lines launchd itself writes are never lost. systemd and
+# Docker already rotate their own logs, so leave them alone. Set
+# LINDA_LOG_FILE yourself (or to "" to disable) to override; LINDA_LOG_MAX_MB
+# and LINDA_LOG_KEEP tune the limits.
+if [[ "$OS" == "Darwin" && -z "${LINDA_LOG_FILE+x}" && ! -t 2 ]]; then
+    export LINDA_LOG_FILE="$PWD/${LINDA_SERVICE_NAME:-linda_cam}.log"
+fi
+
 # macOS resolves the ONNX Runtime dylib by the absolute path main.go hands to
 # onnxruntime_go, so DYLD_LIBRARY_PATH is only a fallback — and System
 # Integrity Protection strips DYLD_* from protected processes anyway.

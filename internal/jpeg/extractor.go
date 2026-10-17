@@ -11,7 +11,28 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/linda/linda_cam/internal/logutil"
 )
+
+// Watchdog tuning. At 2 fps a healthy ffmpeg delivers a frame every 500 ms;
+// going stallTimeout without one means the RTSP session is wedged (a
+// half-open TCP connection after a camera or router power blip never
+// errors out by itself) or the connect is hanging. Either way we kill
+// ffmpeg and reconnect.
+var (
+	stallTimeout = 15 * time.Second
+	stallPoll    = time.Second
+)
+
+const (
+	healthyRun = 60 * time.Second // a run this long resets the retry backoff
+	maxBackoff = 30 * time.Second
+)
+
+// StaleAfter is how old the latest frame may be before consumers should
+// treat the camera as disconnected rather than analyze a frozen image.
+const StaleAfter = 10 * time.Second
 
 // Extractor runs a long-lived ffmpeg subprocess that reads the RTSP stream and
 // emits JPEG stills on stdout at a fixed rate. The most recent JPEG is held
@@ -20,16 +41,17 @@ type Extractor struct {
 	ffmpegPath string
 	fps        int
 
-	mu        sync.RWMutex
-	url       string
-	cancel    context.CancelFunc
-	running   bool
-	connected atomic.Bool
+	mu      sync.RWMutex
+	url     string
+	cancel  context.CancelFunc
+	running bool
 
 	frameMu    sync.RWMutex
 	latest     []byte
 	latestTime time.Time
 	frameSeq   atomic.Uint64
+	// lastFrameNano mirrors latestTime for lock-free freshness checks.
+	lastFrameNano atomic.Int64
 }
 
 func New(ffmpegPath string, fps int) *Extractor {
@@ -67,11 +89,33 @@ func (e *Extractor) Stop() {
 		e.cancel = nil
 	}
 	e.running = false
-	e.connected.Store(false)
+	e.lastFrameNano.Store(0)
 }
 
+// Connected reports whether a frame arrived within StaleAfter. It turns
+// false shortly after the camera drops instead of staying true until ffmpeg
+// happens to exit.
 func (e *Extractor) Connected() bool {
-	return e.connected.Load()
+	return e.FrameAge() < StaleAfter
+}
+
+// FrameAge returns how long ago the latest frame arrived, or a very large
+// duration if none has.
+func (e *Extractor) FrameAge() time.Duration {
+	last := e.lastFrameNano.Load()
+	if last == 0 {
+		return time.Duration(1<<63 - 1)
+	}
+	return time.Since(time.Unix(0, last))
+}
+
+// LastFrameAt returns when the latest frame arrived (zero if never).
+func (e *Extractor) LastFrameAt() time.Time {
+	last := e.lastFrameNano.Load()
+	if last == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, last)
 }
 
 func (e *Extractor) Latest() ([]byte, time.Time) {
@@ -95,10 +139,16 @@ func (e *Extractor) loop(ctx context.Context, url string) {
 		if ctx.Err() != nil {
 			return
 		}
+		started := time.Now()
 		err := e.runOnce(ctx, url)
-		e.connected.Store(false)
+		e.lastFrameNano.Store(0)
 		if ctx.Err() != nil {
 			return
+		}
+		// A run that delivered frames for a while was a real connection;
+		// don't carry an outage's accumulated backoff into its reconnect.
+		if time.Since(started) >= healthyRun {
+			backoff = time.Second
 		}
 		if err != nil {
 			log.Printf("jpeg extractor: ffmpeg exited: %v; retrying in %v", err, backoff)
@@ -108,7 +158,7 @@ func (e *Extractor) loop(ctx context.Context, url string) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < maxBackoff {
 			backoff *= 2
 		}
 	}
@@ -125,7 +175,13 @@ func (e *Extractor) runOnce(ctx context.Context, url string) error {
 		"-q:v", "5",
 		"pipe:1",
 	}
-	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+	// runCtx lets the watchdog kill this ffmpeg without stopping the
+	// extractor; the loop then reconnects with backoff.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
+	cmd.WaitDelay = 5 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -138,11 +194,40 @@ func (e *Extractor) runOnce(ctx context.Context, url string) error {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
+	sup := &logutil.Suppressor{Prefix: "ffmpeg: "}
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		sc.Buffer(make([]byte, 4096), 1<<20)
 		for sc.Scan() {
-			log.Printf("ffmpeg: %s", sc.Text())
+			sup.Log(sc.Text())
+		}
+		sup.Flush()
+	}()
+
+	// Watchdog: no frame for stallTimeout (from process start if none ever
+	// arrived) kills ffmpeg so the loop reconnects.
+	var stalled atomic.Bool
+	go func() {
+		t := time.NewTicker(stallPoll)
+		defer t.Stop()
+		started := time.Now()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-t.C:
+			}
+			last := e.lastFrameNano.Load()
+			idle := time.Since(started)
+			if last != 0 {
+				idle = time.Since(time.Unix(0, last))
+			}
+			if idle >= stallTimeout {
+				log.Printf("jpeg extractor: no frame in %v; restarting ffmpeg", idle.Round(time.Second))
+				stalled.Store(true)
+				runCancel()
+				return
+			}
 		}
 	}()
 
@@ -151,13 +236,17 @@ func (e *Extractor) runOnce(ctx context.Context, url string) error {
 		frame, err := reader.Next()
 		if err != nil {
 			_ = cmd.Wait()
+			if stalled.Load() {
+				return errors.New("stalled (no frames)")
+			}
 			return err
 		}
-		e.connected.Store(true)
+		now := time.Now()
 		e.frameMu.Lock()
 		e.latest = frame
-		e.latestTime = time.Now()
+		e.latestTime = now
 		e.frameMu.Unlock()
+		e.lastFrameNano.Store(now.UnixNano())
 		e.frameSeq.Add(1)
 	}
 }

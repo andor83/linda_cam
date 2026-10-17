@@ -1042,15 +1042,30 @@ type statusOut struct {
 	AnimalsPresent []detector.Detection `json:"animals_present"`
 	LastCaptureAt  time.Time            `json:"last_capture_at"`
 	DetectorReady  bool                 `json:"detector_ready"`
+	// StreamLive is true while the HLS encoder is writing fresh segments;
+	// FrameAgeS is the age of the newest detector frame in seconds (-1 if
+	// none yet). LastFrameAt lets the UI tell "never connected" from
+	// "connected earlier, dropped now".
+	StreamLive  bool      `json:"stream_live"`
+	FrameAgeS   float64   `json:"frame_age_s"`
+	LastFrameAt time.Time `json:"last_frame_at"`
 }
 
 func (a *API) status(w http.ResponseWriter, r *http.Request) {
 	st := a.d.Detector.Status()
+	streamLive := a.d.Streamer.Connected()
+	frameLive := a.d.Extractor.Connected()
 	out := statusOut{
-		RTSPConnected:  a.d.Streamer.Connected() || a.d.Extractor.Connected() || a.d.RTSP.Connected(),
+		RTSPConnected:  streamLive || frameLive || a.d.RTSP.Connected(),
 		AnimalsPresent: st.Present,
 		LastCaptureAt:  st.LastCaptureAt,
 		DetectorReady:  st.DetectorReady,
+		StreamLive:     streamLive,
+		FrameAgeS:      -1,
+		LastFrameAt:    a.d.Extractor.LastFrameAt(),
+	}
+	if !out.LastFrameAt.IsZero() {
+		out.FrameAgeS = time.Since(out.LastFrameAt).Seconds()
 	}
 	if out.AnimalsPresent == nil {
 		out.AnimalsPresent = []detector.Detection{}

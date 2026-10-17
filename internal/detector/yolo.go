@@ -450,8 +450,18 @@ func (d *Detector) loop(ctx context.Context) {
 }
 
 func (d *Detector) tick() {
-	frame, _ := d.extractor.Latest()
+	frame, at := d.extractor.Latest()
 	if frame == nil {
+		return
+	}
+	// A frame older than StaleAfter means the camera feed has stopped;
+	// re-running inference on the frozen image would keep "animal
+	// present" lit and could re-capture the same picture, so clear the
+	// live state and wait for fresh frames.
+	if time.Since(at) > jpeg.StaleAfter {
+		d.stateMu.Lock()
+		d.present = nil
+		d.stateMu.Unlock()
 		return
 	}
 	img, _, err := image.Decode(bytes.NewReader(frame))
@@ -1935,9 +1945,12 @@ func (d *Detector) DebugDetect(threshold float32, topK int) ([]Detection, error)
 	if !d.ready.Load() {
 		return nil, fmt.Errorf("detector not ready")
 	}
-	frame, _ := d.extractor.Latest()
+	frame, at := d.extractor.Latest()
 	if frame == nil {
 		return nil, fmt.Errorf("no frame available yet")
+	}
+	if time.Since(at) > jpeg.StaleAfter {
+		return nil, fmt.Errorf("camera feed stalled (last frame %s ago)", time.Since(at).Round(time.Second))
 	}
 	img, _, err := image.Decode(bytes.NewReader(frame))
 	if err != nil {

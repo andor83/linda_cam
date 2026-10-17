@@ -95,6 +95,20 @@ Most of these are exposed in the **Settings** tab. The full set lives in
   with timestamp, classes, top confidence, and saved-picture filename.
 - **Auth** — single password (bcrypt-hashed) and HMAC-signed session
   cookie; sessions last 30 days by default.
+- **Dropout recovery** — every camera pull (HLS encoder, detector frame
+  grabber, RTSP client) runs under a watchdog. If the camera or router
+  loses power the TCP session usually just goes silent rather than
+  closing; after 15–20 s without a new frame or HLS segment the ffmpeg
+  process is killed and reconnected with backoff (reset after a healthy
+  minute). The HLS playlist carries an `EXT-X-DISCONTINUITY` across the
+  restart and the Live page restarts its player if the picture stops
+  advancing, so a brief outage heals without restarting the server.
+  `/api/status` exposes `stream_live`, `frame_age_s` and `last_frame_at`.
+- **Log hygiene** — repeated ffmpeg/RTSP warnings are collapsed into
+  "repeated N times" lines, and when `LINDA_LOG_FILE` is set the log is
+  rotated at `LINDA_LOG_MAX_MB` (20) keeping `LINDA_LOG_KEEP` (3) old
+  copies. `launch.sh` sets it automatically for the macOS launchd service;
+  systemd and Docker keep using their own journal/log rotation.
 
 ## Running outside Docker
 

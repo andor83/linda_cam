@@ -11,6 +11,24 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/linda/linda_cam/internal/logutil"
+)
+
+// Watchdog tuning. ffmpeg rewrites the playlist every segment (2 s), so a
+// playlist that has not changed in stallTimeout means ffmpeg is wedged —
+// typically a half-open TCP session after the camera or router lost power,
+// which never errors out on its own. It also covers a connect that hangs.
+var (
+	stallTimeout = 20 * time.Second
+	stallPoll    = 2 * time.Second
+)
+
+const (
+	liveWindow      = 10 * time.Second // playlist updated this recently => "connected"
+	healthyRun      = 60 * time.Second // a run this long resets the retry backoff
+	maxBackoff      = 30 * time.Second
+	restartAnnounce = "stream: no new HLS segment in %v; restarting ffmpeg"
 )
 
 // Streamer runs a long-lived ffmpeg subprocess that pulls the RTSP stream
@@ -24,12 +42,15 @@ type Streamer struct {
 	audioMode  string // "copy" or "mp3"
 	outDir     string
 
-	mu        sync.Mutex
-	url       string
-	cancel    context.CancelFunc
-	done      chan struct{}
-	running   bool
-	connected atomic.Bool
+	mu      sync.Mutex
+	url     string
+	cancel  context.CancelFunc
+	done    chan struct{}
+	running bool
+
+	// lastProgress is the unix-nano time the playlist was last seen to
+	// change; zero while no ffmpeg is producing output.
+	lastProgress atomic.Int64
 }
 
 func New(ffmpegPath, audioMode, outDir string) *Streamer {
@@ -45,7 +66,22 @@ func New(ffmpegPath, audioMode, outDir string) *Streamer {
 
 func (s *Streamer) OutDir() string { return s.outDir }
 
-func (s *Streamer) Connected() bool { return s.connected.Load() }
+// Connected reports whether ffmpeg has written a fresh playlist recently.
+// It goes false within liveWindow of the camera dropping, instead of staying
+// true until the process happens to exit.
+func (s *Streamer) Connected() bool {
+	last := s.lastProgress.Load()
+	return last != 0 && time.Since(time.Unix(0, last)) < liveWindow
+}
+
+// LastProgress returns when the HLS output last advanced (zero if never).
+func (s *Streamer) LastProgress() time.Time {
+	last := s.lastProgress.Load()
+	if last == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, last)
+}
 
 func (s *Streamer) SetURL(url string) {
 	s.mu.Lock()
@@ -64,7 +100,7 @@ func (s *Streamer) SetURL(url string) {
 	if oldDone != nil {
 		<-oldDone
 	}
-	s.connected.Store(false)
+	s.lastProgress.Store(0)
 
 	if url == "" {
 		return
@@ -101,7 +137,7 @@ func (s *Streamer) Stop() {
 	if oldDone != nil {
 		<-oldDone
 	}
-	s.connected.Store(false)
+	s.lastProgress.Store(0)
 }
 
 func (s *Streamer) loop(ctx context.Context, url string) {
@@ -110,10 +146,17 @@ func (s *Streamer) loop(ctx context.Context, url string) {
 		if ctx.Err() != nil {
 			return
 		}
+		started := time.Now()
 		err := s.runOnce(ctx, url)
-		s.connected.Store(false)
+		s.lastProgress.Store(0)
 		if ctx.Err() != nil {
 			return
+		}
+		// A run that streamed for a while before dying was a real
+		// connection; don't punish the reconnect with the backoff that
+		// accumulated during an earlier outage.
+		if time.Since(started) >= healthyRun {
+			backoff = time.Second
 		}
 		if err != nil {
 			log.Printf("stream: ffmpeg exited: %v; retrying in %v", err, backoff)
@@ -123,7 +166,7 @@ func (s *Streamer) loop(ctx context.Context, url string) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < maxBackoff {
 			backoff *= 2
 		}
 	}
@@ -201,12 +244,22 @@ func (s *Streamer) runOnce(ctx context.Context, url string) error {
 		"-f", "hls",
 		"-hls_time", "2",
 		"-hls_list_size", "6",
-		"-hls_flags", "delete_segments+append_list+omit_endlist",
+		// append_list continues the media sequence across ffmpeg restarts
+		// so players don't see the playlist jump backwards; discont_start
+		// marks the first new segment with EXT-X-DISCONTINUITY so they
+		// expect the timestamp reset instead of stalling on it.
+		"-hls_flags", "delete_segments+append_list+omit_endlist+discont_start",
 		"-hls_segment_filename", filepath.Join(s.outDir, "seg_%05d.ts"),
 		filepath.Join(s.outDir, "stream.m3u8"),
 	)
 
-	cmd := exec.CommandContext(ctx, s.ffmpegPath, args...)
+	// runCtx lets the watchdog kill this ffmpeg without tearing down the
+	// whole streamer; the loop then reconnects with backoff.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	cmd := exec.CommandContext(runCtx, s.ffmpegPath, args...)
+	cmd.WaitDelay = 5 * time.Second
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return err
@@ -215,20 +268,65 @@ func (s *Streamer) runOnce(ctx context.Context, url string) error {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
+	sup := &logutil.Suppressor{Prefix: "ffmpeg-stream: "}
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		sc.Buffer(make([]byte, 4096), 1<<20)
 		for sc.Scan() {
-			line := sc.Text()
-			// The first "Opening ..." or "Output #0" line is a good signal
-			// that ffmpeg connected; the stream file appearing is better but
-			// this is cheap.
-			log.Printf("ffmpeg-stream: %s", line)
-			s.connected.Store(true)
+			sup.Log(sc.Text())
 		}
+		sup.Flush()
 	}()
 
-	return cmd.Wait()
+	stalled := make(chan time.Duration, 1)
+	go s.watchdog(runCtx, runCancel, filepath.Join(s.outDir, "stream.m3u8"), stalled)
+
+	waitErr := cmd.Wait()
+	select {
+	case idle := <-stalled:
+		return fmt.Errorf("stalled (no HLS output for %v)", idle.Round(time.Second))
+	default:
+	}
+	if runCtx.Err() != nil && ctx.Err() == nil {
+		return fmt.Errorf("killed by watchdog")
+	}
+	return waitErr
+}
+
+// watchdog polls the playlist's mtime. Each change refreshes lastProgress;
+// no change for stallTimeout (measured from process start if ffmpeg never
+// produced anything) cancels runCtx, which SIGKILLs ffmpeg. The idle
+// duration is reported on stalled so runOnce can say why it died.
+func (s *Streamer) watchdog(runCtx context.Context, runCancel context.CancelFunc, playlist string, stalled chan<- time.Duration) {
+	t := time.NewTicker(stallPoll)
+	defer t.Stop()
+	// Seed with the current mtime so a playlist left over from the previous
+	// run doesn't count as progress for the new process.
+	var lastMod time.Time
+	if st, err := os.Stat(playlist); err == nil {
+		lastMod = st.ModTime()
+	}
+	lastChange := time.Now()
+	for {
+		select {
+		case <-runCtx.Done():
+			return
+		case <-t.C:
+		}
+		if st, err := os.Stat(playlist); err == nil && !st.ModTime().Equal(lastMod) {
+			lastMod = st.ModTime()
+			lastChange = time.Now()
+			s.lastProgress.Store(lastChange.UnixNano())
+			continue
+		}
+		if idle := time.Since(lastChange); idle >= stallTimeout {
+			log.Printf(restartAnnounce, idle.Round(time.Second))
+			s.lastProgress.Store(0)
+			stalled <- idle
+			runCancel()
+			return
+		}
+	}
 }
 
 // resetDir removes all entries inside dir (but not dir itself) and ensures

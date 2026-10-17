@@ -17,6 +17,8 @@ import (
 	mch264 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	mch265 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 	"github.com/pion/rtp"
+
+	"github.com/linda/linda_cam/internal/logutil"
 )
 
 // VideoCodec identifies which H.26x variant is currently being pulled.
@@ -111,6 +113,10 @@ type Client struct {
 	audioSinksMu sync.RWMutex
 	audioSinks   map[int]AudioSink
 	audioNextID  int
+
+	// decodeLog collapses the per-fragment decode warnings a lossy link
+	// produces; set for the lifetime of each runOnce.
+	decodeLog *logutil.Suppressor
 }
 
 func NewClient() *Client {
@@ -272,12 +278,29 @@ func (c *Client) runOnce(ctx context.Context, rawURL string) error {
 		return fmt.Errorf("parse url: %w", err)
 	}
 
+	// Pull over TCP: the default UDP transport drops packets whenever the
+	// Wi-Fi hiccups, which the decoder then reports once per fragment —
+	// that alone wrote ~9 million lines to the log in six weeks. TCP also
+	// means ReadTimeout fires on a dead camera instead of silent loss.
+	proto := gortsplib.ProtocolTCP
+	lost := &logutil.Suppressor{Prefix: "rtsp: ", Window: time.Minute}
 	client := gortsplib.Client{
 		Scheme:       u.Scheme,
 		Host:         u.Host,
+		Protocol:     &proto,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
+		OnPacketsLost: func(n uint64) {
+			lost.Log("RTP packets lost")
+		},
+		OnDecodeError: func(err error) {
+			lost.Log("decode: " + err.Error())
+		},
 	}
+	defer lost.Flush()
+	decodeLog := &logutil.Suppressor{Prefix: "rtsp: decode: ", Window: time.Minute}
+	defer decodeLog.Flush()
+	c.decodeLog = decodeLog
 
 	if err := client.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
@@ -357,7 +380,7 @@ func (c *Client) setupH264(client *gortsplib.Client, desc *description.Session, 
 		nalus, err := rtpDec.Decode(pkt)
 		if err != nil {
 			if err != rtph264.ErrNonStartingPacketAndNoPrevious && err != rtph264.ErrMorePacketsNeeded {
-				log.Printf("rtsp: decode: %v", err)
+				c.decodeLog.Log(err.Error())
 			}
 			return
 		}
@@ -424,7 +447,7 @@ func (c *Client) setupH265(client *gortsplib.Client, desc *description.Session, 
 		nalus, err := rtpDec.Decode(pkt)
 		if err != nil {
 			if err != rtph265.ErrNonStartingPacketAndNoPrevious && err != rtph265.ErrMorePacketsNeeded {
-				log.Printf("rtsp: decode: %v", err)
+				c.decodeLog.Log(err.Error())
 			}
 			return
 		}
